@@ -1,0 +1,21 @@
+# Core ML
+torch>=2.2.0
+numpy>=1.26.0
+
+# Pokemon battle engine (Gen 8) — requires Rust toolchain
+# Install with: pip install poke-engine --config-settings="build-args=--features poke-engine/gen8 --no-default-features"
+poke-engine
+
+# Pokemon Showdown client (ladder evaluation only)
+poke-env>=0.8.1
+
+# RL / Gymnasium
+gymnasium>=0.29.0
+
+# Distributed training
+ray>=2.9.0
+
+# Utilities
+tqdm>=4.66.0
+pyyaml>=6.0.1
+requests>=2.31.0
