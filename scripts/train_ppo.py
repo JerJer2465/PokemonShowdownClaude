@@ -323,6 +323,7 @@ def main():
                 avg_rollout = _t_rollout_total / _n_logged * 1000
                 avg_read    = _t_read_total    / _n_logged * 1000
                 avg_ppo     = _t_ppo_total     / _n_logged * 1000
+                batch_stats = server.get_batch_stats()
                 print(
                     f"update={update+1:6d}/{total_updates}  "
                     f"steps={total_steps/1e6:.2f}M  "
@@ -331,7 +332,9 @@ def main():
                     f"v_loss={stats['value_loss']:.4f}  "
                     f"H={stats['entropy']:.3f}  "
                     f"lr={stats['lr']:.2e}  "
-                    f"[rollout={avg_rollout:.0f}ms read={avg_read:.0f}ms ppo={avg_ppo:.0f}ms]",
+                    f"[rollout={avg_rollout:.0f}ms read={avg_read:.0f}ms ppo={avg_ppo:.0f}ms "
+                    f"batch={batch_stats['avg_batch']:.1f} "
+                    f"graph={batch_stats.get('graph_pct', 0):.0f}%]",
                     flush=True,
                 )
                 # TensorBoard scalars

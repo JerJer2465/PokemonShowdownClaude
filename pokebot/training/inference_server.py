@@ -14,10 +14,6 @@ IPC protocol:
     obs data: worker → obs_shm[i]  (SharedMemory, no serialization)
     results:  server → res_shm[i]  (SharedMemory, no serialization)
 
-Pipe vs Queue latency (Windows):
-    mp.Queue one-way: ~0.7ms  → 64 signals = 45ms
-    mp.Pipe  one-way: ~0.14ms → 64 signals =  9ms  (5x speedup)
-
 CUDA Graphs:
     After a warmup phase, the server captures a CUDA graph for the full
     max_batch forward pass. Subsequent dispatches replay the graph with
@@ -99,6 +95,11 @@ class InferenceServer:
         else:
             self._stream = None
 
+        # Batch size tracking
+        self._batch_sizes: list[int] = []
+        self._graph_dispatches = 0
+        self._total_dispatches = 0
+
         # CUDA graph state
         self._graph: torch.cuda.CUDAGraph | None = None
         self._warmup_count = 0
@@ -137,16 +138,18 @@ class InferenceServer:
     def _collect_batch(self) -> list[_Request]:
         """
         Use connection.wait() to multiplex all worker obs pipes simultaneously.
-        Block until at least one worker signals, then drain up to max_batch.
-        Returns empty list only if server is stopping.
+        Block until at least one worker signals, then drain all ready workers.
+
+        Relies on "natural batching": while _dispatch processes the previous
+        batch (~3ms GPU), workers accumulate their signals. The next
+        _collect_batch immediately finds them, giving batch sizes of ~15-20
+        with 32 workers.
 
         Windows WaitForMultipleObjects limit: 63 handles per call.
-        We chunk the connections and merge results.
         """
-        _WIN_LIMIT = 63  # Windows WaitForMultipleObjects max handles
+        _WIN_LIMIT = 63
 
         def _wait_chunked(conns, timeout):
-            """Call connection.wait() in chunks of _WIN_LIMIT, return all ready."""
             ready = []
             for start in range(0, len(conns), _WIN_LIMIT):
                 chunk = conns[start : start + _WIN_LIMIT]
@@ -158,22 +161,28 @@ class InferenceServer:
             if not ready:
                 continue
 
-            # Drain signals from all ready connections (they sent b'\x00')
             batch: list[_Request] = []
+            seen = set()
             for conn in ready:
-                conn.recv_bytes()  # consume the signal byte
-                batch.append(_Request(self._conn_to_id[conn]))
+                conn.recv_bytes()
+                wid = self._conn_to_id[conn]
+                if wid not in seen:
+                    batch.append(_Request(wid))
+                    seen.add(wid)
                 if len(batch) >= self.max_batch:
                     break
 
-            # If we have room, do one more wait(0) pass to grab stragglers
+            # Quick non-blocking drain to grab stragglers
             if len(batch) < self.max_batch:
                 extra = _wait_chunked(self.obs_pipe_ends, 0)
                 for conn in extra:
                     if len(batch) >= self.max_batch:
                         break
                     conn.recv_bytes()
-                    batch.append(_Request(self._conn_to_id[conn]))
+                    wid = self._conn_to_id[conn]
+                    if wid not in seen:
+                        batch.append(_Request(wid))
+                        seen.add(wid)
 
             return batch
 
@@ -183,19 +192,17 @@ class InferenceServer:
     def _dispatch(self, batch: list[_Request]):
         """Read obs from shared memory, run GPU forward, write results back."""
         n = len(batch)
+        self._batch_sizes.append(n)
+        self._total_dispatches += 1
 
         with self._weight_lock:
-            # Stack obs from shared memory
-            int_ids_list     = [self._obs_views[r.worker_id][0].copy() for r in batch]
-            float_feats_list = [self._obs_views[r.worker_id][1].copy() for r in batch]
-            legal_mask_list  = [self._obs_views[r.worker_id][2].copy() for r in batch]
-
-            int_ids_np     = np.stack(int_ids_list)      # (n, 15, 8)
-            float_feats_np = np.stack(float_feats_list)  # (n, 15, F)
-            legal_mask_np  = np.stack(legal_mask_list)   # (n, 10)
+            # Stack obs from shared memory (workers are blocked, shm safe to read)
+            int_ids_np     = np.stack([self._obs_views[r.worker_id][0] for r in batch])
+            float_feats_np = np.stack([self._obs_views[r.worker_id][1] for r in batch])
+            legal_mask_np  = np.stack([self._obs_views[r.worker_id][2] for r in batch])
 
             if self._use_cuda_graph and self._graph is not None:
-                # CUDA graph replay path: copy into static buffers, replay, read
+                self._graph_dispatches += 1
                 log_probs, values = self._graph_replay(
                     int_ids_np, float_feats_np, legal_mask_np, n
                 )
@@ -259,9 +266,7 @@ class InferenceServer:
             # Allocate static input buffers
             self._static_int   = torch.zeros(M, *int_shape, dtype=torch.long, device=dev)
             self._static_float = torch.zeros(M, *float_shape, dtype=torch.float32, device=dev)
-            self._static_legal = torch.zeros(M, *legal_shape, dtype=torch.float32, device=dev)
-            # Set legal_mask to all-ones by default (zero-padded slots get uniform dist)
-            self._static_legal.fill_(1.0)
+            self._static_legal = torch.ones(M, *legal_shape, dtype=torch.float32, device=dev)
 
             # Warmup run on the dedicated stream to populate autograd caches
             with torch.cuda.stream(self._stream):
@@ -293,13 +298,12 @@ class InferenceServer:
 
     def _graph_replay(self, int_ids_np, float_feats_np, legal_mask_np, n):
         """Copy data into static buffers, replay CUDA graph, return results."""
-        M = self.max_batch
-
         with torch.cuda.stream(self._stream):
-            # Zero-fill static buffers for padding slots
-            self._static_int.zero_()
-            self._static_float.zero_()
-            self._static_legal.fill_(1.0)
+            # Zero-fill padding slots only (not entire buffer)
+            if n < self.max_batch:
+                self._static_int[n:].zero_()
+                self._static_float[n:].zero_()
+                self._static_legal[n:].fill_(1.0)
 
             # Copy actual data into the first n slots
             self._static_int[:n].copy_(
@@ -321,6 +325,22 @@ class InferenceServer:
         return self._static_log_probs, self._static_values
 
     # ------------------------------------------------------------------
+
+    def get_batch_stats(self) -> dict:
+        """Return and reset batch size statistics."""
+        sizes = self._batch_sizes
+        graph_d = self._graph_dispatches
+        total_d = self._total_dispatches
+        self._batch_sizes = []
+        self._graph_dispatches = 0
+        self._total_dispatches = 0
+        if not sizes:
+            return {"avg_batch": 0, "n_dispatches": 0, "graph_pct": 0}
+        return {
+            "avg_batch": float(np.mean(sizes)),
+            "n_dispatches": total_d,
+            "graph_pct": graph_d / max(total_d, 1) * 100,
+        }
 
     def update_weights(self, state_dict: dict):
         """Hot-swap model weights (call from main thread after PPO update)."""
