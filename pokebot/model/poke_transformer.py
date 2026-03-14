@@ -122,7 +122,7 @@ class PokeTransformer(nn.Module):
         legal_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        int_ids    : (batch, n_tokens, 7)    — integer IDs for embedding lookup
+        int_ids    : (batch, n_tokens, 8)    — integer IDs for embedding lookup
         float_feats: (batch, n_tokens, F)    — float features per token
         legal_mask : (batch, n_actions)      — 1.0 = legal
 

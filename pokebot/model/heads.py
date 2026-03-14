@@ -21,7 +21,14 @@ class PolicyHead(nn.Module):
         Returns     : (batch, n_actions)  — log-probabilities (log-softmax)
         """
         logits = self.linear(actor_token)
-        logits = logits.masked_fill(legal_mask == 0, float("-inf"))
+        # Sanitize any upstream NaN before masking
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+        # If legal_mask is all-zeros for some batch element, fall back to all-ones
+        # to avoid log_softmax(-inf, -inf, …) = NaN
+        all_illegal = (legal_mask.sum(dim=-1, keepdim=True) == 0)
+        safe_mask = legal_mask.clone()
+        safe_mask[all_illegal.expand_as(safe_mask)] = 1.0
+        logits = logits.masked_fill(safe_mask == 0, float("-inf"))
         return F.log_softmax(logits, dim=-1)
 
 

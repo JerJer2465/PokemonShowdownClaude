@@ -8,7 +8,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from pokebot.env.obs_builder import (
-    ObsBuilder, FLOAT_DIM_PER_POKEMON, N_TOKENS,
+    ObsBuilder, FLOAT_DIM_PER_POKEMON, N_TOKENS, N_VOLATILE,
     _one_hot, _bin_hp, _bin_base_power, _encode_stat_boosts, _encode_volatile_status,
     TYPE_TO_IDX, STATUS_TO_IDX, VOLATILE_STATUS_LIST,
 )
@@ -19,9 +19,10 @@ from pokebot.env.obs_builder import (
 # ---------------------------------------------------------------------------
 
 def _make_mon(species="charizard", hp=300, maxhp=300, status=None, slot=0,
-              is_active=False, is_fainted=False, types=None):
+              is_active=False, is_fainted=False, types=None, level=76):
     return {
         "species": species,
+        "level": level,
         "hp": hp,
         "maxhp": maxhp,
         "status": status,
@@ -39,9 +40,6 @@ def _make_mon(species="charizard", hp=300, maxhp=300, status=None, slot=0,
                        "special-attack": 109, "special-defense": 85, "speed": 100},
         "volatile_statuses": ["confusion"],
         "is_fainted": is_fainted,
-        "is_dynamaxed": False,
-        "can_dynamax": True,
-        "dynamax_turns_remaining": 0,
         "is_active": is_active,
     }
 
@@ -66,6 +64,8 @@ def _make_state():
         "terrain_turns": 0,
         "trick_room": False,
         "trick_room_turns": 0,
+        "gravity": False,
+        "gravity_turns": 0,
         "turn": 5,
         "legal_actions": [0, 1, 5, 6, 7],
     }
@@ -120,10 +120,17 @@ def test_stat_boosts_zero():
 
 def test_volatile_status():
     arr = _encode_volatile_status({"confusion", "taunt"})
-    assert arr.shape == (20,)
+    assert arr.shape == (N_VOLATILE,)
     assert arr.sum() == 2.0
     assert arr[0] == 1.0   # confusion is index 0
     assert arr[6] == 1.0   # taunt is index 6
+
+
+def test_volatile_status_new_entries():
+    """New volatiles (torment, nightmare, etc.) should be encoded correctly."""
+    arr = _encode_volatile_status({"torment", "nightmare", "imprison"})
+    assert arr.shape == (N_VOLATILE,)
+    assert arr.sum() == 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +146,7 @@ def test_obs_builder_output_shape():
     assert "float_feats" in obs
     assert "legal_mask" in obs
 
-    assert obs["int_ids"].shape == (N_TOKENS, 7)
+    assert obs["int_ids"].shape == (N_TOKENS, 8)
     assert obs["float_feats"].shape == (N_TOKENS, FLOAT_DIM_PER_POKEMON)
     assert obs["legal_mask"].shape == (10,)
 
@@ -224,6 +231,34 @@ def test_reproducible():
     obs2 = builder.encode(state)
     assert np.allclose(obs1["float_feats"], obs2["float_feats"])
     assert np.array_equal(obs1["int_ids"], obs2["int_ids"])
+
+
+def test_single_type_pokemon_type2_zeros():
+    """Single-type Pokemon should have all-zeros for type2 (not Normal)."""
+    builder = ObsBuilder()
+    state = _make_state()
+    # Magnemite is single-type Electric in Gen 1 (for test purposes, use ["Electric"])
+    state["side_one"]["active"]["types"] = ["Electric"]
+    obs = builder.encode(state)
+    # Token 1 is the own active. Find the type2 region.
+    # type2 starts at offset: 1+10+6+91+7+N_VOLATILE+18 = 133+N_VOLATILE
+    type2_start = 1 + 10 + 6 + 91 + 7 + N_VOLATILE + 18
+    type2_end = type2_start + 18
+    type2_vec = obs["float_feats"][1, type2_start:type2_end]
+    assert np.allclose(type2_vec, 0.0), (
+        f"Single-type Pokemon should have all-zeros type2, got sum={type2_vec.sum()}"
+    )
+
+
+def test_dimension_constants_match():
+    """Verify FLOAT_DIM_PER_POKEMON matches actual encoded output."""
+    builder = ObsBuilder()
+    state = _make_state()
+    obs = builder.encode(state)
+    actual_dim = obs["float_feats"].shape[1]
+    assert actual_dim == FLOAT_DIM_PER_POKEMON, (
+        f"FLOAT_DIM_PER_POKEMON={FLOAT_DIM_PER_POKEMON} but actual output dim={actual_dim}"
+    )
 
 
 if __name__ == "__main__":

@@ -5,3 +5,22 @@ __pycache__/
 *.egg-info/
 .DS_Store
 *.pt
+config/ps_config.py
+
+# Logs
+*.log
+logs/
+
+# Data & artifacts
+data/
+runs/
+replays/
+
+# External dependencies
+pokemon-showdown/
+
+# Benchmark scripts (profiling artifacts)
+scripts/benchmark_*.py
+
+# Temporary / debug scripts
+scripts/_*.py

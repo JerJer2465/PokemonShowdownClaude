@@ -1,7 +1,7 @@
 """
 Build vocabulary index files from Pokemon Showdown data.
 
-Downloads Gen 8 Random Battle set data from pkmn/randbats and
+Downloads Gen 4 Random Battle set data from pkmn/randbats and
 generates species_index.json, move_index.json, ability_index.json, item_index.json.
 
 Usage:
@@ -19,10 +19,10 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 RANDBATS_URL = (
-    "https://raw.githubusercontent.com/pkmn/randbats/main/data/gen8randombattle.json"
+    "https://raw.githubusercontent.com/pkmn/randbats/main/data/gen4randombattle.json"
 )
 
-# Additional moves/species/abilities/items that might appear in Gen 8 battles
+# Additional moves/species/abilities/items that might appear in Gen 4 battles
 # but aren't in randbats (e.g., moves used only by certain mons via level-up)
 EXTRA_MOVES = [
     "struggle", "recharge",  # special cases
@@ -50,12 +50,18 @@ def build_vocabs(randbats: dict) -> tuple[dict, dict, dict, dict]:
 
     for species, data in randbats.items():
         species_set.add(normalize(species))
-        for role_data in data.get("roles", {}).values():
-            for m in role_data.get("moves", []):
+        # Gen 8 format: flat lists directly on species entry
+        # Gen 9 format: nested under "roles" key
+        if "roles" in data:
+            sources = list(data["roles"].values())
+        else:
+            sources = [data]
+        for entry in sources:
+            for m in entry.get("moves", []):
                 move_set.add(normalize(m))
-            for a in role_data.get("abilities", []):
+            for a in entry.get("abilities", []):
                 ability_set.add(normalize(a))
-            for it in role_data.get("items", []):
+            for it in entry.get("items", []):
                 item_set.add(normalize(it))
 
     # Add extras
@@ -85,14 +91,14 @@ def save_json(data: dict, filename: str):
 
 def main():
     # Fetch randbats data
-    randbats_path = os.path.join(DATA_DIR, "gen8randombattle.json")
+    randbats_path = os.path.join(DATA_DIR, "gen4randombattle.json")
     if os.path.exists(randbats_path):
         print(f"Using cached {randbats_path}")
         with open(randbats_path) as f:
             randbats = json.load(f)
     else:
         randbats = fetch_randbats(RANDBATS_URL)
-        save_json(randbats, "gen8randombattle.json")
+        save_json(randbats, "gen4randombattle.json")
 
     print("Building vocabulary indices...")
     species_idx, move_idx, ability_idx, item_idx = build_vocabs(randbats)

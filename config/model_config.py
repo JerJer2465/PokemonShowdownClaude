@@ -1,4 +1,14 @@
-"""Neural network architecture hyperparameters."""
+"""Neural network architecture hyperparameters.
+
+Vocab sizes (n_species, n_moves, etc.) are pulled from GenConfig at runtime.
+This file contains only architecture hyperparameters.
+"""
+
+from config.gen_config import get_gen_config
+from config.training_config import TRAINING_CONFIG
+
+# Pull generation-specific vocab sizes from GenConfig
+_gen_config = get_gen_config(battle_format=TRAINING_CONFIG["battle_format"])
 
 MODEL_CONFIG = {
     # Transformer
@@ -14,12 +24,11 @@ MODEL_CONFIG = {
     "ability_embed_dim": 32,
     "item_embed_dim": 32,
 
-    # Vocabulary sizes (set after build_vocab.py runs)
-    # +1 for UNKNOWN token in each
-    "n_species": 900,
-    "n_moves": 850,
-    "n_abilities": 280,
-    "n_items": 220,
+    # Vocabulary sizes — pulled from GenConfig (generation-specific)
+    "n_species": _gen_config.n_species,
+    "n_moves": _gen_config.n_moves,
+    "n_abilities": _gen_config.n_abilities,
+    "n_items": _gen_config.n_items,
 
     # Action space: 4 moves + 6 switches = 10 (no Dynamax for simplicity)
     # Switch to 14 if Dynamax is added later

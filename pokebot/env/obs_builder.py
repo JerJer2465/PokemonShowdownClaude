@@ -31,7 +31,7 @@ import numpy as np
 N_TYPES = 18
 N_STAT_BOOST_LEVELS = 13   # -6 … +6
 N_STATUS = 7               # healthy, BRN, PSN, TOX, SLP, FRZ, PAR
-N_VOLATILE = 20            # see VOLATILE_STATUS_LIST below
+N_VOLATILE = 27            # see VOLATILE_STATUS_LIST below
 N_MOVES_PER_MON = 4
 N_TEAM_SLOTS = 6
 
@@ -61,6 +61,12 @@ VOLATILE_STATUS_LIST = [
     "embargo", "healblock", "magnetrise", "partiallytrapped",
     "perishsong", "powertrick", "substitute", "yawn",
     "focusenergy", "charge", "stockpile",
+    # Added: Gen 4+ volatiles that were missing
+    "torment", "nightmare", "imprison",
+    "mustrecharge",     # Hyper Beam, Giga Impact, etc.
+    "twoturnmove",      # Fly/Dig/Dive/Bounce semi-invulnerable
+    "destinybond",
+    "grudge",
 ]
 VOLATILE_TO_IDX = {v: i for i, v in enumerate(VOLATILE_STATUS_LIST)}
 
@@ -72,8 +78,12 @@ TERRAIN_TO_IDX = {
     None: 0, "": 0,
     "electricterrain": 1, "grassyterrain": 2, "mistyterrain": 3, "psychicterrain": 4,
 }
+# Note: Gen 4 has no terrain — these always map to 0 during training
 
 MOVE_CATEGORY_TO_IDX = {"physical": 0, "special": 1, "status": 2}
+
+# Offset to slot one-hot within float_feats (used by _pad_team)
+_SLOT_ONEHOT_OFFSET = 1 + 10 + 6 + 91 + 7 + N_VOLATILE + 18 + 18 + 1 + 1
 
 # Map priority integer → one-hot index  (-3 → 0, … +4 → 7)
 PRIORITY_MIN = -3
@@ -135,6 +145,7 @@ class Vocab:
 class MoveFeatures:
     """Float features for one move slot (excluding the embedding index)."""
     base_power_bin: np.ndarray   # (8,)  one-hot
+    accuracy_bin: np.ndarray     # (6,)  one-hot  [0, 50, 70, 80, 90, 100+]
     type_onehot: np.ndarray      # (18,) one-hot
     category_onehot: np.ndarray  # (3,)  one-hot
     priority_onehot: np.ndarray  # (8,)  one-hot  (-3…+4)
@@ -143,11 +154,12 @@ class MoveFeatures:
 
     @property
     def dim(self) -> int:
-        return 8 + 18 + 3 + 8 + 1 + 1  # = 39
+        return 8 + 6 + 18 + 3 + 8 + 1 + 1  # = 45
 
     def to_array(self) -> np.ndarray:
         return np.concatenate([
             self.base_power_bin,
+            self.accuracy_bin,
             self.type_onehot,
             self.category_onehot,
             self.priority_onehot,
@@ -179,9 +191,6 @@ class PokemonToken:
     volatile_multihot: np.ndarray  # (20,)
     type1_onehot: np.ndarray     # (18,)
     type2_onehot: np.ndarray     # (18,)  all-zero if single type
-    is_dynamaxed: float
-    can_dynamax: float
-    dynamax_turns: np.ndarray    # (4,)  one-hot (0,1,2,3 turns remaining)
     is_fainted: float
     is_active: float
     slot_onehot: np.ndarray      # (6,)
@@ -195,36 +204,55 @@ FLOAT_DIM_PER_POKEMON = (
     + 6   # base_stats
     + 91  # stat_boosts
     + 7   # status
-    + 20  # volatile
+    + N_VOLATILE  # volatile multi-hot (27)
     + 18  # type1
     + 18  # type2
-    + 1   # is_dynamaxed
-    + 1   # can_dynamax
-    + 4   # dynamax_turns
     + 1   # is_fainted
     + 1   # is_active
     + 6   # slot
     + 1   # is_own
-    + 4 * 39  # move features (4 × 39)
+    + 4 * 45  # move features (4 × 45: bp_bin(8) + acc_bin(6) + type(18) + cat(3) + pri(8) + pp(1) + known(1))
+    # --- per-pokemon extended features ---
+    + 4   # sleep_turns bin [0, 1, 2, 3+]
+    + 3   # rest_turns bin [0, 1, 2]
+    + 1   # substitute_health (fraction of maxhp)
+    + 1   # force_trapped flag
+    + 4   # move_disabled flags (one per move slot)
+    + 4   # confusion_turns bin [0, 1, 2, 3+]
+    + 1   # taunt flag
+    + 1   # encore flag
+    + 1   # yawn flag (critical: sleep NEXT turn!)
+    + 1   # level_normalized (level / 100.0)
+    + 4   # perish_count_bin [0, 1, 2, 3] (0 = no perish song)
+    + 1   # protect_count_normalized (consecutive protect uses / 4.0)
+    + 1   # locked_move flag (Choice lock / Outrage etc.)
 )
-# = 1+10+6+91+7+20+18+18+1+1+4+1+1+6+1+156 = 342
+# = 1+10+6+91+7+27+18+18+1+1+6+1+180+4+3+1+1+4+4+1+1+1+1+4+1+1 = 394
 
 
 FIELD_DIM = (
     5    # weather one-hot
     + 8  # weather turns bin
-    + 5  # terrain one-hot
-    + 8  # terrain turns bin
+    # terrain removed — Gen 4 has no terrain mechanics
     + 5  # pseudo-weather multi-hot (trick room, gravity, wonder room, etc.)
     + 4  # trick room turns
     + 7  # hazards own (sr=1, spikes=3, tspikes=2, web=1)
     + 7  # hazards opp
-    + 8  # screens own (ls turns 0-5 + reflect turns + aurora veil turns) — simplified to 3 flags + 5 turn bins each
-    + 8  # screens opp
+    + 6  # screens own (light_screen flag+turns, reflect flag+turns) — aurora veil removed (Gen 7+)
+    + 6  # screens opp
     + 10  # turn number bin
     + 2   # total fainted (own / opp) normalized
+    # --- side-level fields ---
+    + 5  # toxic_count own: 5-bin [0, 1, 2, 3-4, 5+]
+    + 5  # toxic_count opp: 5-bin
+    + 2  # tailwind own + opp flags
+    + 2  # wish own + opp flags
+    + 2  # safeguard own + opp flags
+    + 2  # mist own + opp flags
+    + 2  # lucky_chant own + opp flags
+    + 4  # gravity turns bin
 )
-# simplified FIELD_DIM = 77 (exact value computed from to_array below)
+# FIELD_DIM = 76 + 2+2+4 = 84
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +280,16 @@ def _bin_base_power(bp: int) -> np.ndarray:
     idx = np.searchsorted(thresholds, bp, side="right") - 1
     idx = int(np.clip(idx, 0, 7))
     return _one_hot(idx, 8)
+
+
+def _bin_accuracy(acc: int) -> np.ndarray:
+    """6-bin one-hot for move accuracy: [0(status/never-miss), 50, 70, 80, 90, 100+]."""
+    if acc <= 0 or acc > 100:
+        return _one_hot(0, 6)  # bypass accuracy check / never miss / status
+    thresholds = [0, 50, 70, 80, 90, 100]
+    idx = np.searchsorted(thresholds, acc, side="right") - 1
+    idx = int(np.clip(idx, 0, 5))
+    return _one_hot(idx, 6)
 
 
 def _bin_turns(turns: int, max_bin: int = 8) -> np.ndarray:
@@ -302,6 +340,7 @@ def _encode_move(move_data: Optional[dict], is_known: bool, vocab: Vocab) -> tup
         move_idx = UNKNOWN_MOVE_IDX if is_known is False else EMPTY_MOVE_IDX
         feat = MoveFeatures(
             base_power_bin=np.zeros(8, dtype=np.float32),
+            accuracy_bin=np.zeros(6, dtype=np.float32),
             type_onehot=np.zeros(N_TYPES, dtype=np.float32),
             category_onehot=np.zeros(3, dtype=np.float32),
             priority_onehot=np.zeros(8, dtype=np.float32),
@@ -312,6 +351,7 @@ def _encode_move(move_data: Optional[dict], is_known: bool, vocab: Vocab) -> tup
 
     move_idx = vocab.move_idx(move_data.get("id", ""))
     bp = move_data.get("basePower", 0)
+    accuracy = move_data.get("accuracy", 100)
     move_type = move_data.get("type", "Normal").lower()
     category = move_data.get("category", "physical").lower()
     priority = move_data.get("priority", 0)
@@ -323,6 +363,7 @@ def _encode_move(move_data: Optional[dict], is_known: bool, vocab: Vocab) -> tup
 
     feat = MoveFeatures(
         base_power_bin=_bin_base_power(bp),
+        accuracy_bin=_bin_accuracy(accuracy),
         type_onehot=_one_hot(type_idx, N_TYPES),
         category_onehot=_one_hot(MOVE_CATEGORY_TO_IDX.get(category, 0), 3),
         priority_onehot=_one_hot(priority_idx, 8),
@@ -363,7 +404,7 @@ class ObsBuilder:
     def encode(self, state: dict) -> dict:
         """
         Returns a dict with:
-          "int_ids"    : np.ndarray (15, 6)  — [species, m0, m1, m2, m3, ability, item]
+          "int_ids"    : np.ndarray (15, 8)  — [species, m0..m3, ability, item, last_used_move]
                          (query tokens use UNKNOWN for all int IDs)
           "float_feats": np.ndarray (15, float_dim)  — per-token float features
                          (query tokens are all zeros)
@@ -382,16 +423,17 @@ class ObsBuilder:
         opp_tokens = self._pad_team(opp_tokens, is_own=False)
 
         # field_dim float features for token 0; UNKNOWN int IDs
-        # int_ids shape per token: (7,) — [species, m0, m1, m2, m3, ability, item]
-        field_int = np.zeros(7, dtype=np.int64)
+        # int_ids shape per token: (8,) — [species, m0, m1, m2, m3, ability, item, last_used_move]
+        N_INT_IDS = 8
+        field_int = np.zeros(N_INT_IDS, dtype=np.int64)
         field_float = np.pad(field_vec, (0, FLOAT_DIM_PER_POKEMON - len(field_vec))).astype(np.float32)
 
         # Collect all 15 tokens
         all_int_ids = np.stack(
             [field_int] + [t[0] for t in own_tokens] + [t[0] for t in opp_tokens]
-            + [np.zeros(7, dtype=np.int64), np.zeros(7, dtype=np.int64)],
+            + [np.zeros(N_INT_IDS, dtype=np.int64), np.zeros(N_INT_IDS, dtype=np.int64)],
             axis=0,
-        )  # (15, 7)
+        )  # (15, 8)
 
         all_float = np.stack(
             [field_float] + [t[1] for t in own_tokens] + [t[1] for t in opp_tokens]
@@ -415,8 +457,6 @@ class ObsBuilder:
     def _encode_field(self, state: dict) -> np.ndarray:
         weather = state.get("weather", "") or ""
         weather_turns = state.get("weather_turns", 0) or 0
-        terrain = state.get("terrain", "") or ""
-        terrain_turns = state.get("terrain_turns", 0) or 0
         trick_room = state.get("trick_room", False)
         trick_room_turns = state.get("trick_room_turns", 0) or 0
         turn = state.get("turn", 1) or 1
@@ -448,11 +488,29 @@ class ObsBuilder:
         if side_two.get("active", {}).get("is_fainted"):
             opp_fainted += 1
 
+        # NEW: side-level conditions
+        toxic_own = self._encode_toxic_count(side_one.get("toxic_count", 0))
+        toxic_opp = self._encode_toxic_count(side_two.get("toxic_count", 0))
+        tailwind_own = float(side_one.get("tailwind", 0) > 0)
+        tailwind_opp = float(side_two.get("tailwind", 0) > 0)
+        wish_own = float(side_one.get("wish", (0, 0))[0] > 0)
+        wish_opp = float(side_two.get("wish", (0, 0))[0] > 0)
+        safeguard_own = float(side_one.get("safeguard", 0) > 0)
+        safeguard_opp = float(side_two.get("safeguard", 0) > 0)
+
+        # Mist and Lucky Chant (Gen 4+)
+        mist_own = float(side_one.get("mist", 0) > 0)
+        mist_opp = float(side_two.get("mist", 0) > 0)
+        lucky_chant_own = float(side_one.get("lucky_chant", 0) > 0)
+        lucky_chant_opp = float(side_two.get("lucky_chant", 0) > 0)
+
+        # Gravity turns (separate from pseudo-weather flag)
+        gravity_turns = state.get("gravity_turns", 0) or 0
+
         return np.concatenate([
             _one_hot(WEATHER_TO_IDX.get(weather.lower(), 0), 5),
             _bin_turns(weather_turns),
-            _one_hot(TERRAIN_TO_IDX.get(terrain.lower(), 0), 5),
-            _bin_turns(terrain_turns),
+            # Terrain omitted — Gen 4 has no terrain mechanics
             pseudo,
             _bin_turns(trick_room_turns, 4),
             hazards_own,
@@ -461,6 +519,15 @@ class ObsBuilder:
             screens_opp,
             _bin_turn_number(turn),
             [own_fainted / 6.0, opp_fainted / 6.0],
+            # side-level fields
+            toxic_own,
+            toxic_opp,
+            [tailwind_own, tailwind_opp],
+            [wish_own, wish_opp],
+            [safeguard_own, safeguard_opp],
+            [mist_own, mist_opp],
+            [lucky_chant_own, lucky_chant_opp],
+            _bin_turns(gravity_turns, 4),
         ]).astype(np.float32)
 
     def _encode_hazards(self, hazards: dict) -> np.ndarray:
@@ -475,17 +542,27 @@ class ObsBuilder:
         return np.array([sr, *s_feats, *t_feats, web], dtype=np.float32)  # (7,)
 
     def _encode_screens(self, screens: dict) -> np.ndarray:
-        """8-dim: light_screen_turns(0-5) + reflect_turns(0-5) ... simplified to 3 bool + turns."""
+        """6-dim: light_screen (flag+turns) + reflect (flag+turns). Aurora Veil removed (Gen 7+)."""
         ls = int(screens.get("light_screen", 0))
         ref = int(screens.get("reflect", 0))
-        av = int(screens.get("aurora_veil", 0))
-        # Encode each as present-flag + turns-remaining (capped at 5)
         return np.array([
             float(ls > 0), float(ls) / 5.0,
             float(ref > 0), float(ref) / 5.0,
-            float(av > 0), float(av) / 5.0,
-            0.0, 0.0,  # padding to 8
+            0.0, 0.0,  # reserved padding
         ], dtype=np.float32)
+
+    def _encode_toxic_count(self, count: int) -> np.ndarray:
+        """5-bin one-hot for toxic counter: [0, 1, 2, 3-4, 5+]."""
+        if count <= 0:
+            return _one_hot(0, 5)
+        elif count == 1:
+            return _one_hot(1, 5)
+        elif count == 2:
+            return _one_hot(2, 5)
+        elif count <= 4:
+            return _one_hot(3, 5)
+        else:
+            return _one_hot(4, 5)
 
     # ------------------------------------------------------------------
     # Team tokens
@@ -499,7 +576,16 @@ class ObsBuilder:
         tokens = []
         active = side.get("active")
         if active:
-            tokens.append(self._encode_mon(active, slot=0, is_own=is_own, is_active=True))
+            # Inject side-level state into active mon for encoding
+            active_aug = dict(active)
+            active_aug["substitute_health"] = side.get("substitute_health", 0)
+            active_aug["force_trapped"] = side.get("force_trapped", False)
+            active_aug["volatile_durations"] = side.get("volatile_durations", {})
+            active_aug["last_used_move"] = side.get("last_used_move", "none")
+            active_aug["protect_count"] = side.get("protect_count", 0)
+            active_aug["locked_move"] = side.get("locked_move", False)
+            active_aug["perish_count"] = side.get("perish_count", 0)
+            tokens.append(self._encode_mon(active_aug, slot=0, is_own=is_own, is_active=True))
         for i, mon in enumerate(side.get("reserve", [])):
             tokens.append(self._encode_mon(mon, slot=len(tokens), is_own=is_own, is_active=False))
         return tokens
@@ -528,14 +614,15 @@ class ObsBuilder:
             move_idxs.append(midx)
             move_feats.append(mfeat)
 
-        ability_idx = vocab.ability_idx(mon.get("ability") if is_own else None)
-        item_idx = vocab.item_idx(mon.get("item") if is_own else None)
+        ability_idx = vocab.ability_idx(mon.get("ability"))  # None maps to UNKNOWN_IDX
+        item_idx = vocab.item_idx(mon.get("item"))            # None maps to UNKNOWN_IDX
 
-        int_ids = np.array([species_idx, *move_idxs, ability_idx, item_idx], dtype=np.int64)  # (7,)
-        # Pad to 6 for consistent shape: we use 6 cols (species + 4 moves + ability + item = 7, so store as (7,))
-        # Actually reshape to fit our 6-col schema: species, m0, m1, m2, m3, ability (drop item → embed separately)
-        # For simplicity, store all 7 IDs; model will handle indexing.
-        int_ids = np.array([species_idx, *move_idxs, ability_idx, item_idx], dtype=np.int64)
+        # last_used_move: 8th int ID (reuses move vocab)
+        last_move = mon.get("last_used_move", "none")
+        last_move_idx = vocab.move_idx(last_move if last_move and last_move != "none" else None)
+
+        # (8,): species, m0, m1, m2, m3, ability, item, last_used_move
+        int_ids = np.array([species_idx, *move_idxs, ability_idx, item_idx, last_move_idx], dtype=np.int64)
 
         # --- Float features ---
         hp = float(mon.get("hp", 0))
@@ -555,13 +642,51 @@ class ObsBuilder:
 
         types = mon.get("types", ["Normal"])
         type1 = _one_hot(TYPE_TO_IDX.get((types[0] if types else "Normal").lower(), 0), N_TYPES)
-        type2 = _one_hot(TYPE_TO_IDX.get((types[1].lower() if len(types) > 1 else ""), 0), N_TYPES)
-
-        is_dynamaxed = float(mon.get("is_dynamaxed", False))
-        can_dynamax = float(mon.get("can_dynamax", False))
-        dmax_turns = int(mon.get("dynamax_turns_remaining", 0))
+        type2 = (_one_hot(TYPE_TO_IDX.get(types[1].lower(), 0), N_TYPES)
+                 if len(types) > 1 else np.zeros(N_TYPES, dtype=np.float32))
 
         is_fainted = float(mon.get("is_fainted", False) or hp <= 0)
+
+        # --- NEW: per-pokemon features ---
+        sleep_turns = int(mon.get("sleep_turns", 0))
+        sleep_bin = _one_hot(min(sleep_turns, 3), 4)  # [0, 1, 2, 3+]
+
+        rest_turns = int(mon.get("rest_turns", 0))
+        rest_bin = _one_hot(min(rest_turns, 2), 3)  # [0, 1, 2]
+
+        # Substitute health as fraction of maxhp (0 if no sub)
+        sub_hp = float(mon.get("substitute_health", 0))
+        sub_frac = sub_hp / max(max_hp, 1) if sub_hp > 0 else 0.0
+
+        force_trapped = float(mon.get("force_trapped", False))
+
+        # Move disabled flags
+        move_disabled = np.zeros(N_MOVES_PER_MON, dtype=np.float32)
+        for i in range(min(N_MOVES_PER_MON, len(moves))):
+            if moves[i].get("disabled", False):
+                move_disabled[i] = 1.0
+
+        # Volatile durations (from side-level data, only active mon has these)
+        vd = mon.get("volatile_durations", {})
+        confusion_bin = _one_hot(min(int(vd.get("confusion", 0)), 3), 4)
+        taunt_flag = float(int(vd.get("taunt", 0)) > 0)
+        encore_flag = float(int(vd.get("encore", 0)) > 0)
+        yawn_flag = float(int(vd.get("yawn", 0)) > 0)
+
+        # Level (normalized; important for Gen 4 randbats where levels vary)
+        level = float(mon.get("level", 100))
+        level_norm = level / 100.0
+
+        # Perish Song counter (0 = not active, 1-3 = turns remaining)
+        perish_count = int(mon.get("perish_count", 0))
+        perish_bin = _one_hot(min(perish_count, 3), 4)  # [0, 1, 2, 3]
+
+        # Protect counter (consecutive uses, affects success rate)
+        protect_count = int(mon.get("protect_count", 0))
+        protect_norm = min(protect_count, 4) / 4.0
+
+        # Locked move flag (Choice item lock or multi-turn move like Outrage)
+        locked_move = float(mon.get("locked_move", False))
 
         float_feats = np.concatenate([
             [hp_frac],
@@ -572,12 +697,24 @@ class ObsBuilder:
             _encode_volatile_status(volatile),
             type1,
             type2,
-            [is_dynamaxed, can_dynamax],
-            _bin_turns(dmax_turns, 4),
             [float(is_fainted), float(is_active)],
             _one_hot(slot, N_TEAM_SLOTS),
             [float(is_own)],
             *[mf.to_array() for mf in move_feats],
+            # Extended per-pokemon features
+            sleep_bin,
+            rest_bin,
+            [sub_frac],
+            [force_trapped],
+            move_disabled,
+            confusion_bin,
+            [taunt_flag],
+            [encore_flag],
+            [yawn_flag],
+            [level_norm],
+            perish_bin,
+            [protect_norm],
+            [locked_move],
         ]).astype(np.float32)
 
         return int_ids, float_feats
@@ -590,14 +727,13 @@ class ObsBuilder:
             slot = len(tokens)
             int_ids = np.array(
                 [UNKNOWN_SPECIES_IDX, UNKNOWN_MOVE_IDX, UNKNOWN_MOVE_IDX,
-                 UNKNOWN_MOVE_IDX, UNKNOWN_MOVE_IDX, UNKNOWN_ABILITY_IDX, UNKNOWN_ITEM_IDX],
+                 UNKNOWN_MOVE_IDX, UNKNOWN_MOVE_IDX, UNKNOWN_ABILITY_IDX, UNKNOWN_ITEM_IDX,
+                 UNKNOWN_MOVE_IDX],  # last_used_move
                 dtype=np.int64,
             )
             float_feats = np.zeros(FLOAT_DIM_PER_POKEMON, dtype=np.float32)
             # Mark slot position
-            slot_start = (
-                1 + 10 + 6 + 91 + 7 + 20 + 18 + 18 + 1 + 1 + 4 + 1 + 1
-            )  # offset to slot one-hot
+            slot_start = _SLOT_ONEHOT_OFFSET
             if slot_start + slot < FLOAT_DIM_PER_POKEMON:
                 float_feats[slot_start + slot] = 1.0
             # is_own flag
