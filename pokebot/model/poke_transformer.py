@@ -7,11 +7,12 @@ Architecture:
   3. 6-layer Pre-LN Transformer with Poke-Mask:
        - ACTOR token (13) cannot see CRITIC token (14) and vice-versa
        - State tokens (0-12) see each other freely
+       - Mask is a float additive bias (-inf at blocked pairs) so SDPA
+         can use the efficient/flash backend (bool mask forces slow math backend)
   4. Policy head reads from ACTOR output → log-probs over actions
   5. Distributional value head reads from CRITIC output → C51 distribution
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,19 +28,52 @@ ACTOR_IDX = 13
 CRITIC_IDX = 14
 
 
-def _build_poke_mask(n_tokens: int = N_TOKENS) -> torch.Tensor:
+class TransformerBlock(nn.Module):
+    """Pre-LN Transformer block with fused QKV and F.scaled_dot_product_attention.
+
+    Uses SDPA directly instead of nn.MultiheadAttention so that:
+    - Float additive attention bias is supported (enables flash/efficient backends)
+    - No data-dependent control flow (CUDA-graph compatible)
     """
-    Attention mask: True = position is BLOCKED (masked out).
-    ACTOR token cannot attend to CRITIC token, and vice-versa.
-    All state tokens attend to each other freely.
-    Shape: (n_tokens, n_tokens)
-    """
-    mask = torch.zeros(n_tokens, n_tokens, dtype=torch.bool)
-    # Actor cannot see Critic
-    mask[ACTOR_IDX, CRITIC_IDX] = True
-    # Critic cannot see Actor
-    mask[CRITIC_IDX, ACTOR_IDX] = True
-    return mask
+
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.wqkv = nn.Linear(d_model, 3 * d_model)
+        self.wo = nn.Linear(d_model, d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Linear(d_ff, d_model),
+        )
+        self.n_heads = n_heads
+        self.dropout = dropout
+
+    def forward(self, x: torch.Tensor, attn_bias: torch.Tensor = None) -> torch.Tensor:
+        """
+        x: (B, T, D)
+        attn_bias: (1, 1, T, T) float additive mask, -inf at blocked positions
+        """
+        # Pre-LN self-attention
+        h = self.ln1(x)
+        B, T, D = h.shape
+        head_dim = D // self.n_heads
+        qkv = self.wqkv(h).view(B, T, 3, self.n_heads, head_dim)
+        q, k, v = qkv.unbind(dim=2)  # each (B, T, H, head_dim)
+        q = q.transpose(1, 2)  # (B, H, T, head_dim)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        attn = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_bias,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        attn = attn.transpose(1, 2).contiguous().view(B, T, D)
+        x = x + self.wo(attn)
+
+        # Pre-LN FFN
+        x = x + self.ff(self.ln2(x))
+        return x
 
 
 class TokenProjection(nn.Module):
@@ -94,20 +128,17 @@ class PokeTransformer(nn.Module):
         nn.init.normal_(self.actor_query, std=0.02)
         nn.init.normal_(self.critic_query, std=0.02)
 
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=d_ff,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,   # Pre-LN for stability
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        # Transformer layers (manual SDPA for fast attention + CUDA graph compat)
+        self.layers = nn.ModuleList([
+            TransformerBlock(d_model, n_heads, d_ff, dropout)
+            for _ in range(n_layers)
+        ])
 
-        # Poke-Mask (register as buffer so it moves with .to(device))
-        self.register_buffer("poke_mask", _build_poke_mask(N_TOKENS))
+        # Attention bias: float additive mask, -inf at Actor↔Critic
+        attn_bias = torch.zeros(1, 1, N_TOKENS, N_TOKENS)
+        attn_bias[0, 0, ACTOR_IDX, CRITIC_IDX] = float("-inf")
+        attn_bias[0, 0, CRITIC_IDX, ACTOR_IDX] = float("-inf")
+        self.register_buffer("attn_bias", attn_bias)
 
         # Heads
         self.policy_head = PolicyHead(d_model, cfg["n_actions"])
@@ -150,11 +181,12 @@ class PokeTransformer(nn.Module):
         token_proj[:, CRITIC_IDX] = token_proj[:, CRITIC_IDX] * 0 + self.critic_query
 
         # --- Transformer ---
-        out = self.transformer(token_proj, mask=self.poke_mask)  # (B, 15, d_model)
+        for layer in self.layers:
+            token_proj = layer(token_proj, attn_bias=self.attn_bias)
 
         # --- Heads ---
-        actor_out = out[:, ACTOR_IDX]      # (B, d_model)
-        critic_out = out[:, CRITIC_IDX]    # (B, d_model)
+        actor_out = token_proj[:, ACTOR_IDX]      # (B, d_model)
+        critic_out = token_proj[:, CRITIC_IDX]    # (B, d_model)
 
         log_probs = self.policy_head(actor_out, legal_mask)
         value_probs, value = self.value_head(critic_out)
