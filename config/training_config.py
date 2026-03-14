@@ -4,7 +4,7 @@ TRAINING_CONFIG = {
     "total_steps": 250_000_000,
     "num_parallel_envs": 32,
     "rollout_steps": 256,           # Steps per env per rollout → 64 * 256 = 16,384 per cycle
-    "inference_batch_size": 64,     # GPU inference server: max obs per forward pass
+    "inference_batch_size": 32,     # GPU inference server: max obs per forward pass
     "ppo_epochs": 4,
     "minibatch_size": 2048,
     "clip_epsilon": 0.2,

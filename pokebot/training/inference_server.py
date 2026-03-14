@@ -65,7 +65,7 @@ class InferenceServer:
         res_pipe_ends: list,      # list[Connection] — server-side write ends of res pipes
         obs_shms: list,           # list[SharedMemory], one per worker (obs input)
         res_shms: list,           # list[SharedMemory], one per worker (result output)
-        max_batch: int = 64,
+        max_batch: int = 32,
         timeout_ms: float = 0.5,
         use_cuda_graph: bool = True,
     ):
@@ -217,13 +217,10 @@ class InferenceServer:
                     int_ids_np, float_feats_np, legal_mask_np
                 )
 
-            # Sample actions from log_probs
-            actions       = torch.distributions.Categorical(logits=log_probs[:n]).sample()
-            log_prob_vals = log_probs[:n].gather(1, actions.unsqueeze(1)).squeeze(1)
-
-            actions_cpu   = actions.cpu().numpy()
-            log_probs_cpu = log_prob_vals.cpu().numpy()
-            values_cpu    = values[:n].cpu().numpy()
+            # Move to CPU before sampling to avoid GPU OOM when PPO backward
+            # is running concurrently on the default stream
+            lp_cpu = log_probs[:n].cpu()
+            val_cpu = values[:n].cpu()
 
             # Try to capture CUDA graph after warmup
             if (self._use_cuda_graph and self._graph is None
@@ -231,6 +228,14 @@ class InferenceServer:
                 self._warmup_count += 1
                 if self._warmup_count >= _WARMUP_BATCHES:
                     self._try_capture_graph()
+
+        # Sample on CPU (outside weight_lock, no GPU memory needed)
+        actions       = torch.distributions.Categorical(logits=lp_cpu).sample()
+        log_prob_vals = lp_cpu.gather(1, actions.unsqueeze(1)).squeeze(1)
+
+        actions_cpu   = actions.numpy()
+        log_probs_cpu = log_prob_vals.numpy()
+        values_cpu    = val_cpu.numpy()
 
         # Write results to shared memory and signal workers via Pipe
         for i, req in enumerate(batch):
